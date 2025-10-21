@@ -1,0 +1,960 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Long-Short Strategy, Part 2: Trading signals with LightGBM and CatBoost"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this section, we'll start designing, implementing, and evaluating a trading strategy for US equities driven by daily return forecasts produced by gradient boosting models.\n",
+    "\n",
+    "As in the previous examples, we'll lay out a framework and build a specific example that you can adapt to run your own experiments. There are numerous aspects that you can vary, from the asset class and investment universe to more granular aspects like the features, holding period, or trading rules. See, for example, the **Alpha Factor Library** in the [Appendix](../24_alpha_factor_library) for numerous additional features.\n",
+    "\n",
+    "We'll keep the trading strategy simple and only use a single ML signal; a real-life application will likely use multiple signals from different sources, such as complementary ML models trained on different datasets or with different lookahead or lookback periods. It would also use sophisticated risk management, from simple stop-loss to value-at-risk analysis.\n",
+    "\n",
+    "**Six notebooks** cover our workflow sequence:\n",
+    "\n",
+    "1. [preparing_the_model_data](04_preparing_the_model_data.ipyny): we engineer a few simple features from the Quandl Wiki data \n",
+    "2. `trading_signals_with_lightgbm_and_catboost`  (this noteboook): we tune hyperparameters for LightGBM and CatBoost to select a model, using 2015/16 as our validation period. \n",
+    "3. [evaluate_trading_signals](06_evaluate_trading_signals.ipynb): we compare the cross-validation performance using various metrics to select the best model. \n",
+    "4. [model_interpretation](07_model_interpretation.ipynb): we take a closer look at the drivers behind the best model's predictions.\n",
+    "5. [making_out_of_sample_predictions](08_making_out_of_sample_predictions.ipynb): we generate predictions for our out-of-sample test period 2017.\n",
+    "6. [backtesting_with_zipline](09_backtesting_with_zipline.ipynb): evaluate the historical performance of a long-short strategy based on our predictive signals using Zipline."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We'll subset the dataset created in the preceding notebook through the end of 2016 to cross-validate several model configurations for various lookback and lookahead windows, as well as different roll-forward periods and hyperparameters. \n",
+    "\n",
+    "Our approach to model selection will be similar to the one we used in the previous chapter and uses the custom `MultipleTimeSeriesCV` introduced in [Chapter 7, Linear Models – From Risk Factors to Return Forecasts](../07_linear_models)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Imports & Settings"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:53.361121Z",
+     "start_time": "2020-06-21T03:15:53.359422Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "import warnings\n",
+    "warnings.filterwarnings('ignore')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:54.473652Z",
+     "start_time": "2020-06-21T03:15:53.619170Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "%matplotlib inline\n",
+    "\n",
+    "from pathlib import Path\n",
+    "import sys, os\n",
+    "from time import time\n",
+    "from tqdm import tqdm\n",
+    "\n",
+    "from collections import defaultdict\n",
+    "from itertools import product\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "\n",
+    "import lightgbm as lgb\n",
+    "from catboost import Pool, CatBoostRegressor\n",
+    "\n",
+    "from sklearn.linear_model import LinearRegression\n",
+    "from scipy.stats import spearmanr\n",
+    "\n",
+    "from alphalens.tears import (create_summary_tear_sheet,\n",
+    "                             create_full_tear_sheet)\n",
+    "\n",
+    "from alphalens.utils import get_clean_factor_and_forward_returns\n",
+    "\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn as sns"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:54.477216Z",
+     "start_time": "2020-06-21T03:15:54.474618Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "sys.path.insert(1, os.path.join(sys.path[0], '..'))\n",
+    "from utils import MultipleTimeSeriesCV, format_time"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:54.489618Z",
+     "start_time": "2020-06-21T03:15:54.478409Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "sns.set_style('whitegrid')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:54.626839Z",
+     "start_time": "2020-06-21T03:15:54.624975Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "YEAR = 252\n",
+    "idx = pd.IndexSlice"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def format_time(t):\n",
+    "    \"\"\"Return a formatted time string 'HH:MM:SS\n",
+    "    based on a numeric time() value\"\"\"\n",
+    "    m, s = divmod(t, 60)\n",
+    "    h, m = divmod(m, 60)\n",
+    "    return f'{h:0>2.0f}:{m:0>2.0f}:{s:0>2.0f}'\n",
+    "\n",
+    "\n",
+    "class MultipleTimeSeriesCV:\n",
+    "    \"\"\"Generates tuples of train_idx, test_idx pairs\n",
+    "    Assumes the MultiIndex contains levels 'symbol' and 'date'\n",
+    "    purges overlapping outcomes\"\"\"\n",
+    "\n",
+    "    def __init__(self,\n",
+    "                 n_splits=3,\n",
+    "                 train_period_length=126,\n",
+    "                 test_period_length=21,\n",
+    "                 lookahead=None,\n",
+    "                 date_idx='date',\n",
+    "                 shuffle=False):\n",
+    "        self.n_splits = n_splits\n",
+    "        self.lookahead = lookahead\n",
+    "        self.test_length = test_period_length\n",
+    "        self.train_length = train_period_length\n",
+    "        self.shuffle = shuffle\n",
+    "        self.date_idx = date_idx\n",
+    "\n",
+    "    def split(self, X, y=None, groups=None):\n",
+    "        unique_dates = X.index.get_level_values(self.date_idx).unique()\n",
+    "        days = sorted(unique_dates, reverse=True)\n",
+    "        split_idx = []\n",
+    "        for i in range(self.n_splits):\n",
+    "            test_end_idx = i * self.test_length\n",
+    "            test_start_idx = test_end_idx + self.test_length\n",
+    "            train_end_idx = test_start_idx + self.lookahead - 1\n",
+    "            train_start_idx = train_end_idx + self.train_length + self.lookahead - 1\n",
+    "            split_idx.append([train_start_idx, train_end_idx,\n",
+    "                              test_start_idx, test_end_idx])\n",
+    "\n",
+    "        dates = X.reset_index()[[self.date_idx]]\n",
+    "        for train_start, train_end, test_start, test_end in split_idx:\n",
+    "\n",
+    "            train_idx = dates[(dates[self.date_idx] > days[train_start])\n",
+    "                              & (dates[self.date_idx] <= days[train_end])].index\n",
+    "            test_idx = dates[(dates[self.date_idx] > days[test_start])\n",
+    "                             & (dates[self.date_idx] <= days[test_end])].index\n",
+    "            if self.shuffle:\n",
+    "                np.random.shuffle(list(train_idx))\n",
+    "            yield train_idx.to_numpy(), test_idx.to_numpy()\n",
+    "\n",
+    "    def get_n_splits(self, X, y, groups=None):\n",
+    "        return self.n_splits\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Get Data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We select the train and validation sets, and identify labels and features:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.610627Z",
+     "start_time": "2020-06-21T03:15:56.699840Z"
+    },
+    "scrolled": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "<class 'pandas.core.frame.DataFrame'>\n",
+      "MultiIndex: 1749266 entries, ('A', Timestamp('2010-01-04 00:00:00')) to ('ZION', Timestamp('2016-12-30 00:00:00'))\n",
+      "Data columns (total 34 columns):\n",
+      " #   Column           Non-Null Count    Dtype  \n",
+      "---  ------           --------------    -----  \n",
+      " 0   dollar_vol       1749266 non-null  float64\n",
+      " 1   dollar_vol_rank  1749266 non-null  float64\n",
+      " 2   rsi              1735336 non-null  float64\n",
+      " 3   bb_high          1730361 non-null  float64\n",
+      " 4   bb_low           1730359 non-null  float64\n",
+      " 5   NATR             1735336 non-null  float64\n",
+      " 6   ATR              1735336 non-null  float64\n",
+      " 7   PPO              1724391 non-null  float64\n",
+      " 8   MACD             1716431 non-null  float64\n",
+      " 9   sector           1749266 non-null  int64  \n",
+      " 10  r01              1748271 non-null  float64\n",
+      " 11  r05              1744291 non-null  float64\n",
+      " 12  r10              1739316 non-null  float64\n",
+      " 13  r21              1728371 non-null  float64\n",
+      " 14  r42              1707476 non-null  float64\n",
+      " 15  r63              1686581 non-null  float64\n",
+      " 16  r01dec           1748271 non-null  float64\n",
+      " 17  r05dec           1744291 non-null  float64\n",
+      " 18  r10dec           1739316 non-null  float64\n",
+      " 19  r21dec           1728371 non-null  float64\n",
+      " 20  r42dec           1707476 non-null  float64\n",
+      " 21  r63dec           1686581 non-null  float64\n",
+      " 22  r01q_sector      1748271 non-null  float64\n",
+      " 23  r05q_sector      1744291 non-null  float64\n",
+      " 24  r10q_sector      1739316 non-null  float64\n",
+      " 25  r21q_sector      1728371 non-null  float64\n",
+      " 26  r42q_sector      1707476 non-null  float64\n",
+      " 27  r63q_sector      1686581 non-null  float64\n",
+      " 28  r01_fwd          1749266 non-null  float64\n",
+      " 29  r05_fwd          1749266 non-null  float64\n",
+      " 30  r21_fwd          1749251 non-null  float64\n",
+      " 31  year             1749266 non-null  int64  \n",
+      " 32  month            1749266 non-null  int64  \n",
+      " 33  weekday          1749266 non-null  int64  \n",
+      "dtypes: float64(30), int64(4)\n",
+      "memory usage: 461.2+ MB\n"
+     ]
+    }
+   ],
+   "source": [
+    "data = (pd.read_hdf('data.h5', 'model_data')\n",
+    "            .sort_index()\n",
+    "            .loc[idx[:, :'2016'], :]) # train & validation period\n",
+    "data.info(null_counts=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.627071Z",
+     "start_time": "2020-06-21T03:15:58.611792Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "labels = sorted(data.filter(like='_fwd').columns)\n",
+    "features = data.columns.difference(labels).tolist() # features are columns not containing '_fwd'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Model Selection: Lookback, lookahead and roll-forward periods"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.713463Z",
+     "start_time": "2020-06-21T03:15:58.628189Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "tickers = data.index.get_level_values('symbol').unique()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We may want to predict 1, 5 or 21-day returns:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.716838Z",
+     "start_time": "2020-06-21T03:15:58.714860Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "lookaheads = [1, 5, 21]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.726739Z",
+     "start_time": "2020-06-21T03:15:58.718248Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "categoricals = ['year', 'month', 'sector', 'weekday']"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We select 4.5 and one years as the length of our training periods; test periods are one and three months long. Since we are using two years (2015/16) for validation, a one-month test period implies 24 folds."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.735386Z",
+     "start_time": "2020-06-21T03:15:58.728023Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "train_lengths = [int(4.5 * 252), 252]\n",
+    "test_lengths = [63, 21]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.743174Z",
+     "start_time": "2020-06-21T03:15:58.737182Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "test_params = list(product(lookaheads, train_lengths, test_lengths))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:15:58.751241Z",
+     "start_time": "2020-06-21T03:15:58.744605Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "results_path = Path('results', 'us_stocks')\n",
+    "if not results_path.exists():\n",
+    "    results_path.mkdir(parents=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.920850Z",
+     "start_time": "2020-06-21T03:19:37.913179Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "lr_metrics.to_csv(results_path / 'lin_reg_metrics.csv', index=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## LightGBM Model Tuning"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The notebook example iterates over many configurations, optionally using random samples to speed up model selection using a diverse subset. The goal is to identify the most impactful parameters without trying every possible combination."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.935808Z",
+     "start_time": "2020-06-21T03:19:37.921761Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "def get_fi(model):\n",
+    "    \"\"\"Return normalized feature importance as pd.Series\"\"\"\n",
+    "    fi = model.feature_importance(importance_type='gain')\n",
+    "    return (pd.Series(fi / fi.sum(),\n",
+    "                      index=model.feature_name()))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Hyperparameter Options"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The `base_params` are not affected by cross-validation:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.943601Z",
+     "start_time": "2020-06-21T03:19:37.936926Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "base_params = dict(boosting='gbdt',\n",
+    "                   objective='regression',\n",
+    "                   verbose=-1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We choose the following parameters and values to select our best model (see book chapter for detail):"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.952308Z",
+     "start_time": "2020-06-21T03:19:37.944671Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "# constraints on structure (depth) of each tree\n",
+    "max_depths = [2, 3, 5, 7]\n",
+    "num_leaves_opts = [2 ** i for i in max_depths]\n",
+    "min_data_in_leaf_opts = [250, 500, 1000]\n",
+    "\n",
+    "# weight of each new tree in the ensemble\n",
+    "learning_rate_ops = [.01, .1, .3]\n",
+    "\n",
+    "# random feature selection\n",
+    "feature_fraction_opts = [.3, .6, .95]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.960258Z",
+     "start_time": "2020-06-21T03:19:37.953744Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "param_names = ['learning_rate', 'num_leaves',\n",
+    "               'feature_fraction', 'min_data_in_leaf']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.969006Z",
+     "start_time": "2020-06-21T03:19:37.961383Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "# Parameters: 108\n"
+     ]
+    }
+   ],
+   "source": [
+    "cv_params = list(product(learning_rate_ops,\n",
+    "                         num_leaves_opts,\n",
+    "                         feature_fraction_opts,\n",
+    "                         min_data_in_leaf_opts))\n",
+    "n_params = len(cv_params)\n",
+    "print(f'# Parameters: {n_params}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Train/Test Period Lengths"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.977749Z",
+     "start_time": "2020-06-21T03:19:37.969903Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "lookaheads = [1, 5, 21]\n",
+    "label_dict = dict(zip(lookaheads, labels))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We only use test periods of 63 days length to save some model training and evaluation time."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.986465Z",
+     "start_time": "2020-06-21T03:19:37.978744Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "train_lengths = [int(4.5 * 252), 252]\n",
+    "test_lengths = [63]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:37.995277Z",
+     "start_time": "2020-06-21T03:19:37.987379Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train configs: 6\n"
+     ]
+    }
+   ],
+   "source": [
+    "test_params = list(product(lookaheads, train_lengths, test_lengths))\n",
+    "n = len(test_params)\n",
+    "test_param_sample = np.random.choice(list(range(n)), size=int(n), replace=False)\n",
+    "test_params = [test_params[i] for i in test_param_sample]\n",
+    "print('Train configs:', len(test_params))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Categorical Variables"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We integer-encode categorical variables with values starting at zero, as expected by LightGBM (not necessary\n",
+    "as long as the category codes have values less than $2^{32}$, but avoids a warning)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.043537Z",
+     "start_time": "2020-06-21T03:19:37.996178Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "categoricals = ['year', 'weekday', 'month']\n",
+    "for feature in categoricals:\n",
+    "    data[feature] = pd.factorize(data[feature], sort=True)[0]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Custom Loss Function: Information Coefficient"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.046578Z",
+     "start_time": "2020-06-21T03:19:38.044405Z"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "def ic_lgbm(preds, train_data):\n",
+    "    \"\"\"Custom IC eval metric for lightgbm\"\"\"\n",
+    "    is_higher_better = True\n",
+    "    return 'ic', spearmanr(preds, train_data.get_label())[0], is_higher_better"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Run Cross-Validation"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "To explore the hyperparameter space, we specify values for key parameters that we would like to test in combination. The sklearn library supports `RandomizedSearchCV` to cross-validate a subset of parameter combinations that are sampled randomly from specified distributions. We will implement a custom version that allows us to monitor performance so we can abort the search process once we're satisfied with the result, rather than specifying a set number of iterations beforehand."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.054547Z",
+     "start_time": "2020-06-21T03:19:38.047670Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "lgb_store = Path(results_path / 'tuning_lgb.h5')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.070171Z",
+     "start_time": "2020-06-21T03:19:38.055637Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "labels = sorted(data.filter(like='fwd').columns)\n",
+    "features = data.columns.difference(labels).tolist()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.078077Z",
+     "start_time": "2020-06-21T03:19:38.071079Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "label_dict = dict(zip(lookaheads, labels))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.086476Z",
+     "start_time": "2020-06-21T03:19:38.078921Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "num_iterations = [10, 25, 50, 75] + list(range(100, 501, 50))\n",
+    "num_boost_round = num_iterations[-1]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T03:19:38.094204Z",
+     "start_time": "2020-06-21T03:19:38.087354Z"
+    },
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "metric_cols = (param_names + ['t', 'daily_ic_mean', 'daily_ic_mean_n',\n",
+    "                              'daily_ic_median', 'daily_ic_median_n'] +\n",
+    "               [str(n) for n in num_iterations])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We iterate over our six CV configurations and collect the resulting metrics:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "ExecuteTime": {
+     "end_time": "2020-06-21T11:56:42.000694Z",
+     "start_time": "2020-06-21T03:19:38.095078Z"
+    },
+    "scrolled": false
+   },
+   "outputs": [],
+   "source": [
+    "for lookahead, train_length, test_length in test_params:\n",
+    "    # randomized grid search\n",
+    "    cvp = np.random.choice(list(range(n_params)),\n",
+    "                           size=int(n_params / 2),\n",
+    "                           replace=False)\n",
+    "    cv_params_ = [cv_params[i] for i in cvp]\n",
+    "\n",
+    "    # set up cross-validation\n",
+    "    n_folds = int(2 * YEAR / test_length) # Number of total test periods\n",
+    "    print(f'Lookahead: {lookahead:2.0f} | '\n",
+    "          f'Train: {train_length:3.0f} | '\n",
+    "          f'Test: {test_length:2.0f} | '\n",
+    "          f'Params: {len(cv_params_):3.0f} | '\n",
+    "          f'Train configs: {len(test_params)}')\n",
+    "\n",
+    "    # time-series cross-validation with Combinatorial Purged CV\n",
+    "    from skfolio_cv import SkfolioCombinatorialPurgedCV\n",
+    "    cv = SkfolioCombinatorialPurgedCV(n_splits=n_folds, # Number of train sets to select\n",
+    "                                      n_test_splits=1, # One test set per train set\n",
+    "                                      train_size=train_length,\n",
+    "                                      test_size=test_length,\n",
+    "                                      embargo_size=lookahead,\n",
+    "                                      purge_size=0, # No explicit purge in original logic\n",
+    "                                      date_idx='date')\n",
+    "\n",
+    "    label = label_dict[lookahead]\n",
+    "    outcome_data = data.loc[:, features + [label]].dropna()\n",
+    "    \n",
+    "    # binary dataset\n",
+    "    lgb_data = lgb.Dataset(data=outcome_data.drop(label, axis=1),\n",
+    "                           label=outcome_data[label],\n",
+    "                           categorical_feature=categoricals,\n",
+    "                           free_raw_data=False)\n",
+    "    T = 0\n",
+    "    predictions, metrics, feature_importance, daily_ic = [], [], [], []\n",
+    "    \n",
+    "    # iterate over (shuffled) hyperparameter combinations\n",
+    "    for p, param_vals in enumerate(cv_params_):\n",
+    "        key = f'{lookahead}/{train_length}/{test_length}/' + '/'.join([str(p) for p in param_vals])\n",
+    "        params = dict(zip(param_names, param_vals))\n",
+    "        params.update(base_params)\n",
+    "\n",
+    "        start = time()\n",
+    "        cv_preds, nrounds = [], []\n",
+    "        ic_cv = defaultdict(list)\n",
+    "        \n",
+    "        # iterate over folds\n",
+    "        for i, (train_idx, test_idx) in enumerate(cv.split(X=outcome_data)):\n",
+    "            \n",
+    "            # select train subset\n",
+    "            lgb_train = lgb_data.subset(used_indices=train_idx.tolist(),\n",
+    "                                       params=params).construct()\n",
+    "            \n",
+    "            # train model for num_boost_round\n",
+    "            model = lgb.train(params=params,\n",
+    "                              train_set=lgb_train,\n",
+    "                              num_boost_round=num_boost_round,\n",
+    "                              verbose_eval=False)\n",
+    "            # log feature importance\n",
+    "            if i == 0:\n",
+    "                fi = get_fi(model).to_frame()\n",
+    "            else:\n",
+    "                fi[i] = get_fi(model)\n",
+    "\n",
+    "            # capture predictions\n",
+    "            test_set = outcome_data.iloc[test_idx, :]\n",
+    "            X_test = test_set.loc[:, model.feature_name()]\n",
+    "            y_test = test_set.loc[:, label]\n",
+    "            y_pred = {str(n): model.predict(X_test, num_iteration=n) for n in num_iterations}\n",
+    "            \n",
+    "            # record predictions for each fold\n",
+    "            cv_preds.append(y_test.to_frame('y_test').assign(**y_pred).assign(i=i))\n",
+    "        \n",
+    "        # combine fold results\n",
+    "        cv_preds = pd.concat(cv_preds).assign(**params)\n",
+    "        predictions.append(cv_preds)\n",
+    "        \n",
+    "        # compute IC per day\n",
+    "        by_day = cv_preds.groupby(level='date')\n",
+    "        ic_by_day = pd.concat([by_day.apply(lambda x: spearmanr(x.y_test, x[str(n)])[0]).to_frame(n)\n",
+    "                               for n in num_iterations], axis=1)\n",
+    "        daily_ic_mean = ic_by_day.mean()\n",
+    "        daily_ic_mean_n = daily_ic_mean.idxmax()\n",
+    "        daily_ic_median = ic_by_day.median()\n",
+    "        daily_ic_median_n = daily_ic_median.idxmax()\n",
+    "        \n",
+    "        # compute IC across all predictions\n",
+    "        ic = [spearmanr(cv_preds.y_test, cv_preds[str(n)])[0] for n in num_iterations]\n",
+    "        t = time() - start\n",
+    "        T += t\n",
+    "        \n",
+    "        # collect metrics\n",
+    "        metrics = pd.Series(list(param_vals) +\n",
+    "                            [t, daily_ic_mean.max(), daily_ic_mean_n, daily_ic_median.max(), daily_ic_median_n] + ic,\n",
+    "                            index=metric_cols)\n",
+    "        msg = f'\\t{p:3.0f} | {format_time(T)} ({t:3.0f}) | {params[\"learning_rate\"]:5.2f} | '\n",
+    "        msg += f'{params[\"num_leaves\"]:3.0f} | {params[\"feature_fraction\"]:3.0%} | {params[\"min_data_in_leaf\"]:4.0f} | '\n",
+    "        msg += f' {max(ic):6.2%} | {ic_by_day.mean().max(): 6.2%} | {daily_ic_mean_n: 4.0f} | {ic_by_day.median().max(): 6.2%} | {daily_ic_median_n: 4.0f}'\n",
+    "        print(msg)\n",
+    "\n",
+    "        # persist results for given CV run and hyperparameter combination\n",
+    "        metrics.to_hdf(lgb_store, 'metrics/' + key)\n",
+    "        ic_by_day.assign(**params).to_hdf(lgb_store, 'daily_ic/' + key)\n",
+    "        fi.T.describe().T.assign(**params).to_hdf(lgb_store, 'fi/' + key)\n",
+    "        cv_preds.to_hdf(lgb_store, 'predictions/' + key)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "base",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.9.7"
+  },
+  "toc": {
+   "base_numbering": 1,
+   "nav_menu": {},
+   "number_sections": true,
+   "sideBar": true,
+   "skip_h1_title": true,
+   "title_cell": "Table of Contents",
+   "title_sidebar": "Contents",
+   "toc_cell": false,
+   "toc_position": {
+    "height": "calc(100% - 180px)",
+    "left": "10px",
+    "top": "150px",
+    "width": "292.031px"
+   },
+   "toc_section_display": true,
+   "toc_window_display": true
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
