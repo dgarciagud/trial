@@ -1,19 +1,34 @@
-from datetime import date, timedelta
-from duka.app.app import app as duka_app
-from duka.core.utils import TimeFrame
+# ETF Returns Dashboard
 
-# Rango: últimos 12 meses (evitamos hoy por si aún no hay barra cerrada)
-end = date.today() - timedelta(days=1)
-start = end - timedelta(days=365)
+Descarga automática diaria de los últimos **20 días de cotización** para SPY, QQQ y los ETFs sectoriales SPDR. Genera un bar chart de retornos acumulados ordenado de mayor a menor.
 
-# Descarga D1 para EURUSD y USDJPY, con cabecera, en carpeta ./data
-duka_app(
-    symbols=['EURUSD', 'USDJPY'],
-    start=start,
-    end=end,
-    threads=8,                  # ajusta según tu conexión/CPU
-    timeframe=TimeFrame.D1,     # vela diaria
-    folder='data',
-    header=True                 # para que el CSV tenga cabecera
-)
-print(f"Listo: {start} → {end}")
+## Último gráfico
+
+![ETF Returns](charts/etf_returns_latest.png)
+
+> Actualizado automáticamente cada día laborable a las **08:00 UTC** via GitHub Actions.
+
+## ETFs incluidos
+
+| Ticker | Sector |
+|--------|--------|
+| SPY | S&P 500 |
+| QQQ | Nasdaq 100 |
+| XLK | Technology |
+| XLF | Financials |
+| XLV | Health Care |
+| XLI | Industrials |
+| XLY | Consumer Discretionary |
+| XLP | Consumer Staples |
+| XLE | Energy |
+| XLB | Materials |
+| XLC | Communication Services |
+| XLRE | Real Estate |
+| XLU | Utilities |
+
+## Ejecución manual
+
+```bash
+pip install -r requirements.txt
+python etf_returns.py
+```
